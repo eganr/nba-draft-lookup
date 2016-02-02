@@ -1,0 +1,198 @@
+<?php
+
+require('XMLStats.class.php');
+
+/*
+    Implements hook_menu
+ */
+function nbadraft_menu() {
+    $items = array();
+
+    $items['admin/config/system/import-data'] = array(
+        'title' => t('Import NBA Draft Data'),
+        'description' => t('Run data import from NBA Draft API'),
+        'access arguments' => array('administer site configuration'),
+        'type' => MENU_NORMAL_ITEM,
+        'page callback' => 'drupal_get_form',
+        'page arguments' => array('nbadraft_import_form'),
+    );
+
+    return $items;
+}
+
+function nbadraft_import_form($form, &$form_status) {
+    $q = db_select('taxonomy_term_data', 't')
+        ->fields('t', array('name'))
+        ->condition('vid', 2) // TODO: dynamically pull in the vid from the name
+        ->execute();
+
+    $data = $q->fetchAllAssoc('name');
+    $select = array();
+
+    foreach ($data as $name => $value) {
+        $select[$name] = $name;
+    }
+
+    $form['draft_year'] = array(
+        '#type' => 'select',
+        '#title' => t('Draft Year'),
+        '#options' => $select,
+        '#description' => t('Draft year you want to import')
+    );
+
+    $form['submit'] = array(
+        '#type' => 'submit',
+        '#title' => 'Submit',
+        '#value' => 'Submit'
+    );
+
+    return $form;
+}
+
+/*
+    Implements form_submit
+ */
+function nbadraft_import_form_submit($form, &$form_state) {
+    $form_state['rebuild'] = TRUE;
+
+    // INTEGER: Draft year we are working with (ex. 2014)
+    $draft_year = $form_state['values']['draft_year'];
+    $draft_year_tid = get_term_id_for_draft_year($draft_year);
+
+    // ARRAY:STDCLASS data from the API representing draft picks for a year
+    $response_data = XMLStats::GetDraftDataForSeason($draft_year);
+    krumo($response_data);
+
+    // DELETE All Nodes in Draft Pick that have the selected draft_year taxonomy type
+    delete_nodes_for_draft_year($draft_year);
+
+    // Loop through $response_data and build array of insertable Draft Pick nodes
+    foreach ($response_data as $api_draft_pick) {
+        create_node_for_draft_pick($api_draft_pick, $draft_year_tid);
+    }
+}
+
+function get_term_id_for_draft_team($draft_team) {
+    $name = $draft_team->full_name;
+    $q = db_select('taxonomy_term_data', 't')
+        ->fields('t', array('tid'))
+        ->condition('vid', 3) // TODO: dynamically pull in the vid from the name
+        ->condition('name', $name)
+        ->execute()
+        ->fetchAssoc();
+
+    if ($q) {
+        return $q['tid'];
+    } else {
+        return insert_draft_team($draft_team);
+    }
+}
+
+function insert_draft_team($draft_team) {
+    krumo($draft_team);
+
+    $term = new stdClass();
+    $term->name = $draft_team->full_name;
+    $term->language = LANGUAGE_NONE;
+    $term->vid = '3'; // TODO: dynamically insert
+    $term->field_abbreviation[$term->language][]['value'] = $draft_team->abbreviation;
+    $term->field_city[$term->language][]['value'] = $draft_team->first_name;
+    $term->field_team_name[$term->language][]['value'] = $draft_team->last_name;
+
+    taxonomy_term_save($term);
+
+    return $term->tid;
+}
+
+function get_term_id_for_position($position) {
+    $q = db_select('taxonomy_term_data', 't')
+        ->fields('t', array('tid'))
+        ->condition('vid', 4) // TODO: dynamically pull in the vid from the name
+        ->condition('name', $position)
+        ->execute()->fetchAssoc();
+
+    if (!$q) {
+        return 1;
+    }
+
+    return $q['tid'];
+}
+
+function get_term_id_for_draft_year($draft_year) {
+    $q = db_select('taxonomy_term_data', 't')
+        ->fields('t', array('tid'))
+        ->condition('vid', 2)
+        ->condition('name', $draft_year)
+        ->execute()->fetchAssoc();
+
+    return $q['tid'];
+}
+
+function create_node_for_draft_pick($api_draft_pick, $draft_year_tid) {
+    global $user;
+
+    $node = new stdClass();
+
+    // Setting defaults
+    $node->title = $api_draft_pick->player->display_name;
+    $node->type = 'draft_pick';
+    node_object_prepare($node);
+    $node->language = LANGUAGE_NONE;
+    $node->uid = $user->uid;
+    $node->status = 1; //(1 or 0): published or not
+    $node->promote = 0; //(1 or 0): promoted to front page
+    $node->comment = 0; // 0 = comments disabled, 1 = read only, 2 = read/write
+
+    // Plain fields
+    $node->field_first_name[$node->language][]['value'] = $api_draft_pick->player->first_name;
+    $node->field_last_name[$node->language][]['value'] = $api_draft_pick->player->last_name;
+    $node->field_round[$node->language][]['value'] = $api_draft_pick->round;
+    $node->field_pick[$node->language][]['value'] = $api_draft_pick->pick;
+    $node->field_overall_pick[$node->language][]['value'] = $api_draft_pick->overall_pick;
+    $node->field_birthday[$node->language][]['value'] = $api_draft_pick->player->birthdate;
+    $node->field_height_in_[$node->language][]['value'] = $api_draft_pick->player->height_in;
+    $node->field_weight_lbs_[$node->language][]['value'] = $api_draft_pick->player->weight_lb;
+    $node->field_games_played[$node->language][]['value'] = $api_draft_pick->games_played;
+    $node->field_points[$node->language][]['value'] = $api_draft_pick->points;
+    $node->field_assists[$node->language][]['value'] = $api_draft_pick->assists;
+    $node->field_defensive_rebounds[$node->language][]['value'] = $api_draft_pick->defensive_rebounds;
+    $node->field_offensive_rebounds[$node->language][]['value'] = $api_draft_pick->offensive_rebounds;
+    $node->field_steals[$node->language][]['value'] = $api_draft_pick->steals;
+    $node->field_blocks[$node->language][]['value'] = $api_draft_pick->blocks;
+
+    // Term reference (Draft Year) field
+    $node->field_draft_year[$node->language][]['tid'] = $draft_year_tid;
+
+    // Term reference (Draft Team) field
+    $node->field_draft_team[$node->language][]['tid'] = get_term_id_for_draft_team($api_draft_pick->team);
+
+    // Term reference (Position) field
+    $node->field_position[$node->language][]['tid'] = get_term_id_for_position($api_draft_pick->player->position);
+
+    node_save($node);
+}
+
+function delete_nodes_for_draft_year($draft_year) {
+    $query = db_select('field_data_field_draft_year', 'n')
+        ->fields('n', array('entity_id'))
+        ->execute()->fetchAllAssoc('entity_id');
+
+    if (!$query) {
+        return;
+    }
+
+    foreach ($query as $db_node) {
+
+        $nid = $db_node->entity_id;
+        $node = node_load($nid);
+
+        if ($node) {
+            $draft_year_field = field_get_items('node', $node, 'field_draft_year');
+            $draft_year_value = field_view_value('node', $node, 'field_draft_year', $draft_year_field[0]);
+
+            if ($draft_year_value['#title'] == $draft_year) {
+                node_delete($nid);
+            }
+        }
+    }
+}
